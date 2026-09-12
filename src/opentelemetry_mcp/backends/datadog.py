@@ -32,6 +32,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
+
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
@@ -58,12 +60,20 @@ _FACET_FIELDS = {
 
 # Default lookback window used when a query has no time range and there is no
 # narrower signal (e.g. get_trace, list_services). Datadog's span search
-# requires filter.from/filter.to; APM span retention is commonly far shorter
-# than this, so it errs toward "wide enough to find something" rather than
-# being a claim about actual retention.
-_DEFAULT_LOOKBACK = timedelta(days=7)
+# requires filter.from/filter.to. 30 days matches the upper end of Datadog's
+# commonly documented standard APM retention (15 or 30 days depending on the
+# account's retention filter) - a shorter default risked reporting a
+# genuinely-retained-but-older trace as not found. If an account has a custom
+# retention filter longer than 30 days, this will still miss traces beyond
+# that window.
+_DEFAULT_LOOKBACK = timedelta(days=30)
 
 _MAX_TRACES_TO_HYDRATE = 50
+
+# Safety bound on how many pages _search_spans_raw will follow via Datadog's
+# cursor pagination for a single logical search (each page up to 1000 spans,
+# Datadog's own per-page max), so a pathological query can't loop forever.
+_MAX_SEARCH_PAGES = 10
 
 
 class DatadogBackend(BaseBackend):
@@ -88,6 +98,11 @@ class DatadogBackend(BaseBackend):
         """
         super().__init__(url, api_key, timeout)
 
+        if not self.url.startswith("https://"):
+            raise ValueError(
+                "Datadog backend requires an https:// URL - DD-API-KEY and "
+                "DD-APPLICATION-KEY must not be sent over plain http"
+            )
         if not self.api_key:
             raise ValueError("Datadog backend requires an API key (BACKEND_API_KEY)")
         if not app_key:
@@ -97,6 +112,28 @@ class DatadogBackend(BaseBackend):
             )
 
         self.app_key = app_key
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        """Get or create HTTP client with connection pooling.
+
+        Overrides BaseBackend to disable automatic redirect-following.
+        DD-API-KEY/DD-APPLICATION-KEY are non-standard headers that httpx
+        does not strip on cross-origin redirects (unlike Authorization/
+        Cookie/Proxy-Authorization), so following a redirect to an
+        unexpected host would leak both credentials there.
+
+        Returns:
+            Reusable AsyncClient instance with automatic connection pooling
+        """
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=self.url,
+                headers=self._create_headers(),
+                timeout=self.timeout,
+                follow_redirects=False,
+            )
+        return self._client
 
     def _create_headers(self) -> dict[str, str]:
         """Create headers for Datadog API requests.
@@ -137,6 +174,15 @@ class DatadogBackend(BaseBackend):
         search-then-hydrate approach) so a partial/filtered span match still
         yields a complete trace.
 
+        The initial span search is used only to discover candidate
+        trace_ids - it is not trusted to have applied the query's filters
+        correctly at the trace level. A native filter can match because one
+        arbitrary child span satisfied it, which says nothing about whether
+        the *reconstructed trace* actually satisfies a trace-level query
+        (e.g. `service_name` here means "the trace's root service", not
+        "any span in the trace"). Every filter is therefore re-applied via
+        FilterEngine against the fully-hydrated trace before returning.
+
         Args:
             query: Trace query parameters
 
@@ -149,13 +195,6 @@ class DatadogBackend(BaseBackend):
         all_filters = query.get_all_filters()
         supported_operators = self.get_supported_operators()
         native_filters = [f for f in all_filters if f.operator in supported_operators]
-        client_filters = [f for f in all_filters if f.operator not in supported_operators]
-
-        if client_filters:
-            logger.info(
-                f"Will apply {len(client_filters)} filters client-side: "
-                f"{[f.operator.value for f in client_filters]}"
-            )
 
         dd_query = self._build_dd_query(native_filters)
         start, end = self._time_range(query.start_time, query.end_time)
@@ -184,8 +223,10 @@ class DatadogBackend(BaseBackend):
             except Exception as e:
                 logger.warning(f"Failed to fetch trace {trace_id}: {e}")
 
-        if client_filters:
-            traces = FilterEngine.apply_filters(traces, client_filters)
+        # Re-verify every filter (not just the ones Datadog couldn't apply)
+        # against the fully-hydrated trace - see docstring.
+        if all_filters:
+            traces = FilterEngine.apply_filters(traces, all_filters)
 
         return traces[: query.limit]
 
@@ -242,14 +283,20 @@ class DatadogBackend(BaseBackend):
             httpx.HTTPError: If the API request fails
         """
         start, end = self._time_range(None, None, lookback=_DEFAULT_LOOKBACK)
-        dd_query = f"trace_id:{trace_id}"
+        # trace_id can originate from an external MCP tool call - escape and
+        # exact-quote it rather than interpolating it raw into the query, so
+        # it can't inject additional query clauses.
+        dd_query = f"trace_id:{self._escape_dd_query_value(trace_id)}"
 
         spans_data = await self._search_spans_raw(dd_query, start, end, limit=1000)
 
         spans: list[SpanData] = []
         for span_obj in spans_data:
             span = self._parse_dd_span(span_obj)
-            if span:
+            # Belt-and-suspenders: only keep spans that exactly match the
+            # requested trace_id, in case the query above ever matches more
+            # broadly than intended.
+            if span and span.trace_id == trace_id:
                 spans.append(span)
 
         if not spans:
@@ -341,13 +388,19 @@ class DatadogBackend(BaseBackend):
     async def _search_spans_raw(
         self, dd_query: str, start: datetime, end: datetime, limit: int
     ) -> list[dict[str, Any]]:
-        """Call the Datadog Spans search endpoint and return raw span objects.
+        """Call the Datadog Spans search endpoint, following pagination.
+
+        Datadog caps a single page at 1000 spans (`meta.page.after` is the
+        cursor for the next one). This follows that cursor across multiple
+        requests until either `limit` spans have been collected or the API
+        stops returning a continuation cursor, bounded by
+        `_MAX_SEARCH_PAGES` so a pathological query can't loop indefinitely.
 
         Args:
             dd_query: Datadog span search query string
             start: Start of the search window
             end: End of the search window
-            limit: Maximum spans to request (capped at Datadog's own 1000 max)
+            limit: Target total number of spans to collect
 
         Returns:
             List of raw ``Span`` objects (each with ``id``/``type``/``attributes``)
@@ -355,27 +408,49 @@ class DatadogBackend(BaseBackend):
         Raises:
             httpx.HTTPError: If the API request fails
         """
-        body = {
-            "data": {
-                "type": "search_request",
-                "attributes": {
-                    "filter": {
-                        "query": dd_query,
-                        "from": start.isoformat(),
-                        "to": end.isoformat(),
+        collected: list[dict[str, Any]] = []
+        cursor: str | None = None
+
+        for _ in range(_MAX_SEARCH_PAGES):
+            remaining = limit - len(collected)
+            if remaining <= 0:
+                break
+
+            page: dict[str, Any] = {"limit": min(max(remaining, 1), 1000)}
+            if cursor:
+                page["cursor"] = cursor
+
+            body = {
+                "data": {
+                    "type": "search_request",
+                    "attributes": {
+                        "filter": {
+                            "query": dd_query,
+                            "from": start.isoformat(),
+                            "to": end.isoformat(),
+                        },
+                        "page": page,
+                        "sort": "-timestamp",
                     },
-                    "page": {"limit": min(max(limit, 1), 1000)},
-                    "sort": "-timestamp",
-                },
+                }
             }
-        }
 
-        response = await self.client.post("/api/v2/spans/events/search", json=body)
-        response.raise_for_status()
+            response = await self.client.post("/api/v2/spans/events/search", json=body)
+            response.raise_for_status()
 
-        data = response.json()
-        result: list[dict[str, Any]] = data.get("data", [])
-        return result
+            data = response.json()
+            collected.extend(data.get("data", []))
+
+            cursor = data.get("meta", {}).get("page", {}).get("after")
+            if not cursor:
+                break
+        else:
+            logger.warning(
+                f"Stopped after {_MAX_SEARCH_PAGES} pages with more results available "
+                f"(query: {dd_query!r}); results may be incomplete"
+            )
+
+        return collected
 
     def _time_range(
         self,
@@ -438,6 +513,24 @@ class DatadogBackend(BaseBackend):
         if " " in value:
             return f'"{value}"'
         return value
+
+    def _escape_dd_query_value(self, value: str) -> str:
+        """Escape and exact-quote a value for safe interpolation into a query.
+
+        Unlike `_quote_if_needed` (which only quotes for readability when a
+        term contains whitespace), this always quotes and escapes embedded
+        quotes/backslashes. Use it for values that can originate from
+        external input (e.g. an MCP tool call's trace_id argument), so they
+        can't inject additional query clauses.
+
+        Args:
+            value: Raw value to interpolate
+
+        Returns:
+            A double-quoted, escaped Datadog query term
+        """
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
 
     def _filter_to_dd_query(self, filter_obj: Filter) -> str | None:
         """Convert a single Filter to a Datadog span search condition.
@@ -525,9 +618,16 @@ class DatadogBackend(BaseBackend):
 
             start_time = self._parse_dd_timestamp(attrs.get("start_timestamp"))
             end_time = self._parse_dd_timestamp(attrs.get("end_timestamp"))
-            duration_ms = (
-                (end_time - start_time).total_seconds() * 1000 if start_time and end_time else 0.0
-            )
+            if start_time is None or end_time is None:
+                # Don't fabricate timing data: a substituted "now" start time
+                # or a zero duration would silently corrupt trace ordering
+                # and duration aggregation for anything that reads this span.
+                logger.warning(
+                    f"Rejecting span {span_id} (trace {trace_id}): missing or "
+                    "invalid start_timestamp/end_timestamp"
+                )
+                return None
+            duration_ms = (end_time - start_time).total_seconds() * 1000
 
             custom_attrs = attrs.get("attributes", {}) or {}
             tags = attrs.get("tags", []) or []
@@ -543,7 +643,7 @@ class DatadogBackend(BaseBackend):
                 parent_span_id=str(parent_span_id) if parent_span_id else None,
                 operation_name=attrs.get("resource_name") or attrs.get("service", "unknown"),
                 service_name=attrs.get("service", "unknown"),
-                start_time=start_time or datetime.now(UTC),
+                start_time=start_time,
                 duration_ms=duration_ms,
                 status=status,
                 attributes=span_attributes,
@@ -649,7 +749,16 @@ class DatadogBackend(BaseBackend):
         trace_end = max(end_times)
         trace_duration_ms = (trace_end - trace_start).total_seconds() * 1000
 
-        trace_status: Any = "ERROR" if any(s.has_error for s in spans) else "OK"
+        # Preserve UNSET rather than defaulting to OK: most spans reaching
+        # here already carry UNSET from _infer_status's best-effort guess,
+        # and "no span confirmed an error" is not the same claim as "every
+        # span confirmed success."
+        if any(s.has_error for s in spans):
+            trace_status: Any = "ERROR"
+        elif all(s.status == "OK" for s in spans):
+            trace_status = "OK"
+        else:
+            trace_status = "UNSET"
 
         return TraceData(
             trace_id=trace_id,

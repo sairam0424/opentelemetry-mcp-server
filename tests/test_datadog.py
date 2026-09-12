@@ -11,6 +11,8 @@ it could find documented.
 """
 
 from datetime import UTC, datetime
+from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -31,6 +33,21 @@ def test_datadog_backend_requires_app_key() -> None:
     """Test that Datadog backend requires an Application key even with an API key."""
     with pytest.raises(ValueError, match="Application key"):
         DatadogBackend(url="https://api.datadoghq.com", api_key=FAKE_API_KEY, app_key=None)
+
+
+def test_datadog_backend_rejects_non_https_url() -> None:
+    """Test that Datadog backend refuses to send credentials over plain http."""
+    with pytest.raises(ValueError, match="https://"):
+        DatadogBackend(url="http://api.datadoghq.com", api_key=FAKE_API_KEY, app_key=FAKE_APP_KEY)
+
+
+def test_datadog_client_disables_redirects() -> None:
+    """Test that the client never follows redirects (custom credential headers
+    are not stripped by httpx on cross-origin redirects)."""
+    backend = DatadogBackend(
+        url="https://api.datadoghq.com", api_key=FAKE_API_KEY, app_key=FAKE_APP_KEY
+    )
+    assert backend.client.follow_redirects is False
 
 
 def test_datadog_backend_initialization() -> None:
@@ -341,3 +358,187 @@ class TestGroupIntoTrace:
         assert trace.root_operation == "root-op"
         assert trace.status == "ERROR"  # child span error propagates to trace status
         assert len(trace.spans) == 2
+
+    def test_group_preserves_unset_when_no_span_confirms_ok_or_error(self) -> None:
+        """No span has an explicit error, but none is explicitly OK either -
+        the trace status must not silently claim OK."""
+        backend = _backend()
+        now = datetime(2023, 1, 2, 9, 42, 36, tzinfo=UTC)
+
+        span = backend._parse_dd_span(
+            {
+                "attributes": {
+                    "trace_id": "t2",
+                    "span_id": "s1",
+                    "service": "svc",
+                    "resource_name": "op",
+                    "start_timestamp": now.isoformat().replace("+00:00", "Z"),
+                    "end_timestamp": now.isoformat().replace("+00:00", "Z"),
+                }
+            }
+        )
+        assert span is not None
+        assert span.status == "UNSET"
+
+        trace = backend._group_into_trace("t2", [span])
+
+        assert trace.status == "UNSET"
+
+
+class TestQueryEscaping:
+    """Test that untrusted values can't inject additional query clauses."""
+
+    def test_escape_quotes_and_wraps_value(self) -> None:
+        backend = _backend()
+        assert backend._escape_dd_query_value("abc123") == '"abc123"'
+
+    def test_escape_handles_embedded_quotes(self) -> None:
+        backend = _backend()
+        assert backend._escape_dd_query_value('a" OR *:*') == '"a\\" OR *:*"'
+
+
+class TestParseDatadogSpanRejectsBadTimestamps:
+    """Test that spans with missing/invalid timing data are rejected rather
+    than parsed with fabricated data."""
+
+    def test_missing_end_timestamp_returns_none(self) -> None:
+        backend = _backend()
+        span_obj = {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": "s1",
+                "service": "svc",
+                "resource_name": "op",
+                "start_timestamp": "2023-01-02T09:42:36.320Z",
+                # end_timestamp missing
+            },
+        }
+        assert backend._parse_dd_span(span_obj) is None
+
+    def test_missing_start_timestamp_returns_none(self) -> None:
+        backend = _backend()
+        span_obj = {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": "s1",
+                "service": "svc",
+                "resource_name": "op",
+                "end_timestamp": "2023-01-02T09:42:36.420Z",
+                # start_timestamp missing
+            },
+        }
+        assert backend._parse_dd_span(span_obj) is None
+
+
+class TestGetTraceExactMatch:
+    """Test get_trace only keeps spans exactly matching the requested trace_id."""
+
+    async def test_filters_out_non_matching_spans(self) -> None:
+        backend = _backend()
+        now = "2023-01-02T09:42:36.320Z"
+        later = "2023-01-02T09:42:36.420Z"
+
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "attributes": {
+                        "trace_id": "requested",
+                        "span_id": "s1",
+                        "service": "svc",
+                        "resource_name": "op",
+                        "start_timestamp": now,
+                        "end_timestamp": later,
+                    }
+                },
+                {
+                    # Wrong trace_id - should be filtered out even though it
+                    # came back from the search.
+                    "attributes": {
+                        "trace_id": "other",
+                        "span_id": "s2",
+                        "service": "svc",
+                        "resource_name": "op",
+                        "start_timestamp": now,
+                        "end_timestamp": later,
+                    }
+                },
+            ]
+        )
+
+        trace = await backend.get_trace("requested")
+
+        assert trace.trace_id == "requested"
+        assert len(trace.spans) == 1
+        assert trace.spans[0].span_id == "s1"
+
+    async def test_escapes_trace_id_in_query(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        with pytest.raises(ValueError, match="No spans found"):
+            await backend.get_trace('evil" OR *:*')
+
+        call_args = backend._search_spans_raw.call_args
+        dd_query = call_args.args[0]
+        assert dd_query == 'trace_id:"evil\\" OR *:*"'
+
+
+class TestSearchSpansRawPagination:
+    """Test that _search_spans_raw follows Datadog's cursor pagination."""
+
+    async def test_follows_cursor_across_pages(self) -> None:
+        backend = _backend()
+
+        page_1 = {
+            "data": [{"attributes": {"span_id": "s1"}}],
+            "meta": {"page": {"after": "cursor-1"}},
+        }
+        page_2 = {
+            "data": [{"attributes": {"span_id": "s2"}}],
+            "meta": {},  # no cursor -> stop
+        }
+        responses: list[dict[str, Any]] = [page_1, page_2]
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, Any]) -> None:
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return self._payload
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse(responses.pop(0))
+
+        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=2)
+
+        assert [s["attributes"]["span_id"] for s in result] == ["s1", "s2"]
+
+    async def test_stops_at_max_pages_without_infinite_loop(self) -> None:
+        backend = _backend()
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                # Always returns a cursor - would loop forever without a cap.
+                return {
+                    "data": [{"attributes": {"span_id": "s"}}],
+                    "meta": {"page": {"after": "always-more"}},
+                }
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=100_000)
+
+        assert len(result) == 10  # _MAX_SEARCH_PAGES pages x 1 span each
