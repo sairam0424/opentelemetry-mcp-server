@@ -1,5 +1,6 @@
 """Pytest configuration and fixtures."""
 
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -76,3 +77,37 @@ def jaeger_backend_config() -> BackendConfig:
         url=HttpUrl("http://localhost:16686"),
         timeout=5.0,
     )
+
+
+@pytest.fixture
+def fake_json_client() -> Callable[..., Any]:
+    """Factory for a fake httpx-like client whose ``post()`` returns the
+    given JSON payloads in sequence, one per call - used to exercise a
+    backend's raw response-parsing code (pagination, malformed envelopes)
+    without a real network dependency.
+
+    Usage: ``client = fake_json_client(payload)`` for a single response, or
+    ``fake_json_client(page_1, page_2)`` for sequential calls (e.g. cursor
+    pagination). A payload can be any JSON-serializable value, including a
+    non-dict, to test a malformed top-level response body.
+    """
+
+    def _make(*payloads: Any) -> Any:
+        responses = list(payloads)
+
+        class FakeResponse:
+            def __init__(self, payload: Any) -> None:
+                self._payload = payload
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> Any:
+                return self._payload
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse(responses.pop(0))
+
+        return type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+    return _make

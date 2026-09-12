@@ -466,7 +466,18 @@ class DatadogBackend(BaseBackend):
                     f"(got {type(page_items).__name__}); treating as empty"
                 )
                 page_items = []
-            collected.extend(item for item in page_items if isinstance(item, dict))
+            # Every consumer of `collected` (search_traces, search_spans,
+            # get_trace, list_services, get_service_operations) does
+            # `item.get("attributes", {}).get(...)` directly, without going
+            # through _parse_dd_span's own try/except - so an item whose
+            # `attributes` value is present but not a dict (e.g.
+            # `{"attributes": "bad"}`) must be excluded here too, not just a
+            # non-dict item itself.
+            collected.extend(
+                item
+                for item in page_items
+                if isinstance(item, dict) and isinstance(item.get("attributes"), dict)
+            )
 
             meta = data.get("meta")
             page_meta = meta.get("page") if isinstance(meta, dict) else None

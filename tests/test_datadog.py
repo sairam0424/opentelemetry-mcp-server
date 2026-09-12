@@ -10,13 +10,14 @@ status is represented) and how this implementation handles both possibilities
 it could find documented.
 """
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
-from opentelemetry_mcp.backends.datadog import DatadogBackend
+from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES, DatadogBackend
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
 
 FAKE_API_KEY = "dd-api1"
@@ -518,7 +519,7 @@ class TestGetTraceExactMatch:
 class TestSearchSpansRawPagination:
     """Test that _search_spans_raw follows Datadog's cursor pagination."""
 
-    async def test_follows_cursor_across_pages(self) -> None:
+    async def test_follows_cursor_across_pages(self, fake_json_client: Callable[..., Any]) -> None:
         backend = _backend()
 
         page_1 = {
@@ -529,88 +530,69 @@ class TestSearchSpansRawPagination:
             "data": [{"attributes": {"span_id": "s2"}}],
             "meta": {},  # no cursor -> stop
         }
-        responses: list[dict[str, Any]] = [page_1, page_2]
-
-        class FakeResponse:
-            def __init__(self, payload: dict[str, Any]) -> None:
-                self._payload = payload
-
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> dict[str, Any]:
-                return self._payload
-
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse(responses.pop(0))
-
-        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+        backend._client = fake_json_client(page_1, page_2)
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=2)
 
         assert [s["attributes"]["span_id"] for s in result] == ["s1", "s2"]
 
-    async def test_stops_at_max_pages_without_infinite_loop(self) -> None:
+    async def test_stops_at_max_pages_without_infinite_loop(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
         backend = _backend()
 
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> dict[str, Any]:
-                # Always returns a cursor - would loop forever without a cap.
-                return {
-                    "data": [{"attributes": {"span_id": "s"}}],
-                    "meta": {"page": {"after": "always-more"}},
-                }
-
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse()
-
-        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+        # Always returns a cursor - would loop forever without a cap.
+        page = {
+            "data": [{"attributes": {"span_id": "s"}}],
+            "meta": {"page": {"after": "always-more"}},
+        }
+        backend._client = fake_json_client(*([page] * _MAX_SEARCH_PAGES))
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=100_000)
 
         assert len(result) == 10  # _MAX_SEARCH_PAGES pages x 1 span each
 
-    async def test_malformed_data_field_does_not_crash(self) -> None:
+    async def test_malformed_data_field_does_not_crash(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
         """A 200 response whose 'data' field isn't a list (or contains a
         non-dict entry) must not corrupt the collected results."""
         backend = _backend()
-
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> dict[str, Any]:
-                return {"data": {"unexpected": {}}, "meta": {}}
-
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse()
-
-        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+        backend._client = fake_json_client({"data": {"unexpected": {}}, "meta": {}})
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=10)
 
         assert result == []
 
-    async def test_non_dict_entries_in_data_are_skipped(self) -> None:
+    async def test_non_dict_entries_in_data_are_skipped(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
         backend = _backend()
+        backend._client = fake_json_client(
+            {"data": [{"attributes": {"span_id": "ok"}}, "not-a-span", 123], "meta": {}}
+        )
 
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                pass
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=10)
 
-            def json(self) -> dict[str, Any]:
-                return {"data": [{"attributes": {"span_id": "ok"}}, "not-a-span", 123], "meta": {}}
+        assert result == [{"attributes": {"span_id": "ok"}}]
 
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse()
-
-        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+    async def test_entry_with_non_dict_attributes_is_skipped(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
+        """An item that is itself a dict, but whose 'attributes' value isn't
+        one, must also be excluded - every consumer does
+        `item.get("attributes", {}).get(...)` directly."""
+        backend = _backend()
+        backend._client = fake_json_client(
+            {
+                "data": [{"attributes": {"span_id": "ok"}}, {"attributes": "bad"}],
+                "meta": {},
+            }
+        )
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=10)
@@ -637,8 +619,6 @@ class TestGetTraceUsesFullPaginationCapacity:
     full pagination capacity, not a single page's worth."""
 
     async def test_requests_full_pagination_capacity(self) -> None:
-        from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES
-
         backend = _backend()
         backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
             return_value=[
@@ -665,40 +645,22 @@ class TestSearchSpansRawMalformedEnvelope:
     """Test that a malformed-but-200 response body doesn't crash
     _search_spans_raw at any navigation step (top-level, meta, meta.page)."""
 
-    async def test_non_dict_top_level_body_does_not_crash(self) -> None:
+    async def test_non_dict_top_level_body_does_not_crash(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
         backend = _backend()
-
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> Any:
-                return ["not", "an", "object"]
-
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse()
-
-        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+        backend._client = fake_json_client(["not", "an", "object"])
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=10)
 
         assert result == []
 
-    async def test_non_dict_meta_does_not_crash(self) -> None:
+    async def test_non_dict_meta_does_not_crash(self, fake_json_client: Callable[..., Any]) -> None:
         backend = _backend()
-
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> dict[str, Any]:
-                return {"data": [{"attributes": {"span_id": "s1"}}], "meta": "not-an-object"}
-
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse()
-
-        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+        backend._client = fake_json_client(
+            {"data": [{"attributes": {"span_id": "s1"}}], "meta": "not-an-object"}
+        )
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=10)
@@ -707,20 +669,13 @@ class TestSearchSpansRawMalformedEnvelope:
         # "no cursor" rather than a crash.
         assert result == [{"attributes": {"span_id": "s1"}}]
 
-    async def test_non_dict_meta_page_does_not_crash(self) -> None:
+    async def test_non_dict_meta_page_does_not_crash(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
         backend = _backend()
-
-        class FakeResponse:
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> dict[str, Any]:
-                return {"data": [{"attributes": {"span_id": "s1"}}], "meta": {"page": "nope"}}
-
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse()
-
-        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+        backend._client = fake_json_client(
+            {"data": [{"attributes": {"span_id": "s1"}}], "meta": {"page": "nope"}}
+        )
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=10)
