@@ -11,6 +11,36 @@ from opentelemetry_mcp.config import BackendConfig
 from opentelemetry_mcp.models import SpanData, TraceData
 
 
+class FakeJsonResponse:
+    """A minimal stand-in for ``httpx.Response`` used by ``fake_json_client``."""
+
+    def __init__(self, payload: Any) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> Any:
+        return self._payload
+
+
+class FakeJsonClient:
+    """A minimal stand-in for ``httpx.AsyncClient`` used by ``fake_json_client``.
+
+    Only implements what ``BaseBackend``'s callers actually use (``post`` and
+    ``is_closed``); it is not a real ``httpx.AsyncClient`` and is not meant to
+    satisfy that type - tests assign it directly to ``backend._client``.
+    """
+
+    is_closed = False
+
+    def __init__(self, *payloads: Any) -> None:
+        self._responses = list(payloads)
+
+    async def post(self, *args: object, **kwargs: object) -> FakeJsonResponse:
+        return FakeJsonResponse(self._responses.pop(0))
+
+
 @pytest.fixture
 def sample_span_data() -> dict[str, Any]:
     """Sample Jaeger span data for testing."""
@@ -80,7 +110,7 @@ def jaeger_backend_config() -> BackendConfig:
 
 
 @pytest.fixture
-def fake_json_client() -> Callable[..., Any]:
+def fake_json_client() -> Callable[..., FakeJsonClient]:
     """Factory for a fake httpx-like client whose ``post()`` returns the
     given JSON payloads in sequence, one per call - used to exercise a
     backend's raw response-parsing code (pagination, malformed envelopes)
@@ -91,23 +121,4 @@ def fake_json_client() -> Callable[..., Any]:
     pagination). A payload can be any JSON-serializable value, including a
     non-dict, to test a malformed top-level response body.
     """
-
-    def _make(*payloads: Any) -> Any:
-        responses = list(payloads)
-
-        class FakeResponse:
-            def __init__(self, payload: Any) -> None:
-                self._payload = payload
-
-            def raise_for_status(self) -> None:
-                pass
-
-            def json(self) -> Any:
-                return self._payload
-
-        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
-            return FakeResponse(responses.pop(0))
-
-        return type("FakeClient", (), {"post": fake_post, "is_closed": False})()
-
-    return _make
+    return FakeJsonClient

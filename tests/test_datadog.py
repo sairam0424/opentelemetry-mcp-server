@@ -12,13 +12,14 @@ it could find documented.
 
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
 from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES, DatadogBackend
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
+
+from .conftest import FakeJsonClient
 
 FAKE_API_KEY = "dd-api1"
 FAKE_APP_KEY = "dd-app1"
@@ -519,7 +520,9 @@ class TestGetTraceExactMatch:
 class TestSearchSpansRawPagination:
     """Test that _search_spans_raw follows Datadog's cursor pagination."""
 
-    async def test_follows_cursor_across_pages(self, fake_json_client: Callable[..., Any]) -> None:
+    async def test_follows_cursor_across_pages(
+        self, fake_json_client: Callable[..., FakeJsonClient]
+    ) -> None:
         backend = _backend()
 
         page_1 = {
@@ -530,7 +533,7 @@ class TestSearchSpansRawPagination:
             "data": [{"attributes": {"span_id": "s2"}}],
             "meta": {},  # no cursor -> stop
         }
-        backend._client = fake_json_client(page_1, page_2)
+        backend._client = fake_json_client(page_1, page_2)  # type: ignore[assignment]
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=2)
@@ -538,7 +541,7 @@ class TestSearchSpansRawPagination:
         assert [s["attributes"]["span_id"] for s in result] == ["s1", "s2"]
 
     async def test_stops_at_max_pages_without_infinite_loop(
-        self, fake_json_client: Callable[..., Any]
+        self, fake_json_client: Callable[..., FakeJsonClient]
     ) -> None:
         backend = _backend()
 
@@ -547,7 +550,7 @@ class TestSearchSpansRawPagination:
             "data": [{"attributes": {"span_id": "s"}}],
             "meta": {"page": {"after": "always-more"}},
         }
-        backend._client = fake_json_client(*([page] * _MAX_SEARCH_PAGES))
+        backend._client = fake_json_client(*([page] * _MAX_SEARCH_PAGES))  # type: ignore[assignment]
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=100_000)
@@ -555,12 +558,12 @@ class TestSearchSpansRawPagination:
         assert len(result) == 10  # _MAX_SEARCH_PAGES pages x 1 span each
 
     async def test_malformed_data_field_does_not_crash(
-        self, fake_json_client: Callable[..., Any]
+        self, fake_json_client: Callable[..., FakeJsonClient]
     ) -> None:
         """A 200 response whose 'data' field isn't a list (or contains a
         non-dict entry) must not corrupt the collected results."""
         backend = _backend()
-        backend._client = fake_json_client({"data": {"unexpected": {}}, "meta": {}})
+        backend._client = fake_json_client({"data": {"unexpected": {}}, "meta": {}})  # type: ignore[assignment]
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=10)
@@ -568,10 +571,10 @@ class TestSearchSpansRawPagination:
         assert result == []
 
     async def test_non_dict_entries_in_data_are_skipped(
-        self, fake_json_client: Callable[..., Any]
+        self, fake_json_client: Callable[..., FakeJsonClient]
     ) -> None:
         backend = _backend()
-        backend._client = fake_json_client(
+        backend._client = fake_json_client(  # type: ignore[assignment]
             {"data": [{"attributes": {"span_id": "ok"}}, "not-a-span", 123], "meta": {}}
         )
 
@@ -581,13 +584,13 @@ class TestSearchSpansRawPagination:
         assert result == [{"attributes": {"span_id": "ok"}}]
 
     async def test_entry_with_non_dict_attributes_is_skipped(
-        self, fake_json_client: Callable[..., Any]
+        self, fake_json_client: Callable[..., FakeJsonClient]
     ) -> None:
         """An item that is itself a dict, but whose 'attributes' value isn't
         one, must also be excluded - every consumer does
         `item.get("attributes", {}).get(...)` directly."""
         backend = _backend()
-        backend._client = fake_json_client(
+        backend._client = fake_json_client(  # type: ignore[assignment]
             {
                 "data": [{"attributes": {"span_id": "ok"}}, {"attributes": "bad"}],
                 "meta": {},
@@ -646,19 +649,21 @@ class TestSearchSpansRawMalformedEnvelope:
     _search_spans_raw at any navigation step (top-level, meta, meta.page)."""
 
     async def test_non_dict_top_level_body_does_not_crash(
-        self, fake_json_client: Callable[..., Any]
+        self, fake_json_client: Callable[..., FakeJsonClient]
     ) -> None:
         backend = _backend()
-        backend._client = fake_json_client(["not", "an", "object"])
+        backend._client = fake_json_client(["not", "an", "object"])  # type: ignore[assignment]
 
         now = datetime(2023, 1, 2, tzinfo=UTC)
         result = await backend._search_spans_raw("*", now, now, limit=10)
 
         assert result == []
 
-    async def test_non_dict_meta_does_not_crash(self, fake_json_client: Callable[..., Any]) -> None:
+    async def test_non_dict_meta_does_not_crash(
+        self, fake_json_client: Callable[..., FakeJsonClient]
+    ) -> None:
         backend = _backend()
-        backend._client = fake_json_client(
+        backend._client = fake_json_client(  # type: ignore[assignment]
             {"data": [{"attributes": {"span_id": "s1"}}], "meta": "not-an-object"}
         )
 
@@ -670,10 +675,10 @@ class TestSearchSpansRawMalformedEnvelope:
         assert result == [{"attributes": {"span_id": "s1"}}]
 
     async def test_non_dict_meta_page_does_not_crash(
-        self, fake_json_client: Callable[..., Any]
+        self, fake_json_client: Callable[..., FakeJsonClient]
     ) -> None:
         backend = _backend()
-        backend._client = fake_json_client(
+        backend._client = fake_json_client(  # type: ignore[assignment]
             {"data": [{"attributes": {"span_id": "s1"}}], "meta": {"page": "nope"}}
         )
 
