@@ -661,10 +661,17 @@ class DatadogBackend(BaseBackend):
             # normalize the same way the EQUALS/NOT_EQUALS branches do,
             # every other field is passed through unchanged.
             is_status = field == "status"
-            or_terms = [
-                f"{field}:{self._escape_dd_query_value(str(v).lower() if is_status else str(v))}"
-                for v in values
-            ]
+            if is_status:
+                normalized = [str(v).lower() for v in values]
+                # A value outside ok/error (e.g. "UNSET") can't be expressed
+                # as a native query at all - fall back to client-side
+                # filtering for the whole IN rather than silently omitting
+                # just that one value from the OR.
+                if any(v not in ("ok", "error") for v in normalized):
+                    return None
+                or_terms = [f"{field}:{self._escape_dd_query_value(v)}" for v in normalized]
+            else:
+                or_terms = [f"{field}:{self._escape_dd_query_value(str(v))}" for v in values]
             return "(" + " OR ".join(or_terms) + ")"
 
         logger.warning(f"Unsupported operator for Datadog query: {operator}")

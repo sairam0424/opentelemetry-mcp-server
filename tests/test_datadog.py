@@ -287,6 +287,32 @@ class TestBuildDatadogQuery:
         )
         assert backend._filter_to_dd_query(f) == '(status:"ok" OR status:"error")'
 
+    def test_in_status_unset_is_unsupported(self) -> None:
+        """ "UNSET" isn't a real Datadog status facet value - a native
+        query for it can never match, so it must be rejected (not silently
+        included as an unmatchable OR term)."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.IN,
+            values=["UNSET"],
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
+    def test_in_status_partial_unset_is_unsupported(self) -> None:
+        """One unsupported value in the list invalidates the whole native
+        IN query - falling back to client-side filtering for all of it
+        rather than silently dropping just the bad value from the OR."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.IN,
+            values=["OK", "UNSET"],
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
     def test_build_dd_query_empty_defaults_to_wildcard(self) -> None:
         backend = _backend()
         assert backend._build_dd_query([]) == ("*", [])
