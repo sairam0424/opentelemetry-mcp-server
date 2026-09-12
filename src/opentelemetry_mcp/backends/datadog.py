@@ -611,6 +611,8 @@ class DatadogBackend(BaseBackend):
         elif operator == FilterOperator.NOT_EQUALS:
             if field == "status" and value == "ERROR":
                 return "-status:error"
+            if field == "status" and value == "OK":
+                return "-status:ok"
             v = value * scale if isinstance(value, int | float) else value
             return f"-{field}:{self._escape_dd_query_value(str(v))}"
 
@@ -649,7 +651,14 @@ class DatadogBackend(BaseBackend):
         elif operator == FilterOperator.IN:
             if not values:
                 return None
-            or_terms = [f"{field}:{self._escape_dd_query_value(str(v))}" for v in values]
+            # Datadog's status facet values are lowercase ("ok", "error");
+            # normalize the same way the EQUALS/NOT_EQUALS branches do,
+            # every other field is passed through unchanged.
+            is_status = field == "status"
+            or_terms = [
+                f"{field}:{self._escape_dd_query_value(str(v).lower() if is_status else str(v))}"
+                for v in values
+            ]
             return "(" + " OR ".join(or_terms) + ")"
 
         logger.warning(f"Unsupported operator for Datadog query: {operator}")

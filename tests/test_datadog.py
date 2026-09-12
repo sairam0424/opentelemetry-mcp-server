@@ -130,6 +130,29 @@ class TestBuildDatadogQuery:
         )
         assert backend._filter_to_dd_query(f) == "status:error"
 
+    def test_status_ok_not_equals(self) -> None:
+        """Datadog's status facet is lowercase - a query for -status:"OK"
+        would never match anything, so NOT_EQUALS must normalize casing the
+        same way EQUALS already does."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.NOT_EQUALS,
+            value="OK",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) == "-status:ok"
+
+    def test_status_error_not_equals(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.NOT_EQUALS,
+            value="ERROR",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) == "-status:error"
+
     def test_duration_gte_converts_ms_to_ns(self) -> None:
         backend = _backend()
         f = Filter(
@@ -202,6 +225,19 @@ class TestBuildDatadogQuery:
         assert backend._filter_to_dd_query(f) == (
             '(@gen_ai.system:"openai" OR @gen_ai.system:"anthropic")'
         )
+
+    def test_in_normalizes_status_casing(self) -> None:
+        """IN must lowercase status values the same way EQUALS/NOT_EQUALS
+        do - Datadog's status facet is lowercase, so an uppercase term
+        would silently never match."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.IN,
+            values=["OK", "ERROR"],
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) == '(status:"ok" OR status:"error")'
 
     def test_build_dd_query_empty_defaults_to_wildcard(self) -> None:
         backend = _backend()
