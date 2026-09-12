@@ -447,10 +447,18 @@ class DatadogBackend(BaseBackend):
 
             data = response.json()
 
-            # A 200 response with an unexpected shape (e.g. `data` not a
-            # list, or a non-dict entry) would otherwise get extended into
-            # `collected` as-is and blow up later wherever a caller does
-            # `span_obj.get(...)`. Validate the shape here instead.
+            # A 200 response with an unexpected shape (a scalar/list body, a
+            # non-list `data`, a non-dict entry within it, or a non-dict
+            # `meta`/`meta.page`) would otherwise crash here or get bad
+            # entries extended into `collected`. Validate defensively at
+            # each navigation step instead of trusting the shape.
+            if not isinstance(data, dict):
+                logger.warning(
+                    f"Datadog search response body was not an object "
+                    f"(got {type(data).__name__}); treating as empty"
+                )
+                break
+
             page_items = data.get("data", [])
             if not isinstance(page_items, list):
                 logger.warning(
@@ -460,7 +468,9 @@ class DatadogBackend(BaseBackend):
                 page_items = []
             collected.extend(item for item in page_items if isinstance(item, dict))
 
-            cursor = data.get("meta", {}).get("page", {}).get("after")
+            meta = data.get("meta")
+            page_meta = meta.get("page") if isinstance(meta, dict) else None
+            cursor = page_meta.get("after") if isinstance(page_meta, dict) else None
             if not isinstance(cursor, str) or not cursor:
                 break
         else:

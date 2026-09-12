@@ -659,3 +659,70 @@ class TestGetTraceUsesFullPaginationCapacity:
 
         call_args = backend._search_spans_raw.call_args
         assert call_args.kwargs.get("limit") == _MAX_SEARCH_PAGES * 1000
+
+
+class TestSearchSpansRawMalformedEnvelope:
+    """Test that a malformed-but-200 response body doesn't crash
+    _search_spans_raw at any navigation step (top-level, meta, meta.page)."""
+
+    async def test_non_dict_top_level_body_does_not_crash(self) -> None:
+        backend = _backend()
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> Any:
+                return ["not", "an", "object"]
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=10)
+
+        assert result == []
+
+    async def test_non_dict_meta_does_not_crash(self) -> None:
+        backend = _backend()
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return {"data": [{"attributes": {"span_id": "s1"}}], "meta": "not-an-object"}
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=10)
+
+        # The one valid span is still collected; malformed meta just means
+        # "no cursor" rather than a crash.
+        assert result == [{"attributes": {"span_id": "s1"}}]
+
+    async def test_non_dict_meta_page_does_not_crash(self) -> None:
+        backend = _backend()
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return {"data": [{"attributes": {"span_id": "s1"}}], "meta": {"page": "nope"}}
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=10)
+
+        assert result == [{"attributes": {"span_id": "s1"}}]
