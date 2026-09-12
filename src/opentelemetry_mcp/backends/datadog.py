@@ -601,19 +601,17 @@ class DatadogBackend(BaseBackend):
         scale = 1_000_000 if is_duration else 1
 
         if operator == FilterOperator.EQUALS:
-            if field == "status" and value == "ERROR":
-                return "status:error"
-            if field == "status" and value == "OK":
-                return "status:ok"
-            v = value * scale if isinstance(value, int | float) else value
+            # Datadog's status facet is lowercase ("ok", "error"); Filter.value
+            # isn't constrained to match that casing (it's a freeform
+            # str|int|float|bool from any caller), so normalize rather than
+            # whitelisting specific literal casings like "OK"/"ERROR".
+            v = value.lower() if field == "status" and isinstance(value, str) else value
+            v = v * scale if isinstance(v, int | float) else v
             return f"{field}:{self._escape_dd_query_value(str(v))}"
 
         elif operator == FilterOperator.NOT_EQUALS:
-            if field == "status" and value == "ERROR":
-                return "-status:error"
-            if field == "status" and value == "OK":
-                return "-status:ok"
-            v = value * scale if isinstance(value, int | float) else value
+            v = value.lower() if field == "status" and isinstance(value, str) else value
+            v = v * scale if isinstance(v, int | float) else v
             return f"-{field}:{self._escape_dd_query_value(str(v))}"
 
         elif operator in (

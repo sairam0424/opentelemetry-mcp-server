@@ -128,7 +128,7 @@ class TestBuildDatadogQuery:
             value="ERROR",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_dd_query(f) == "status:error"
+        assert backend._filter_to_dd_query(f) == 'status:"error"'
 
     def test_status_ok_not_equals(self) -> None:
         """Datadog's status facet is lowercase - a query for -status:"OK"
@@ -141,7 +141,7 @@ class TestBuildDatadogQuery:
             value="OK",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_dd_query(f) == "-status:ok"
+        assert backend._filter_to_dd_query(f) == '-status:"ok"'
 
     def test_status_error_not_equals(self) -> None:
         backend = _backend()
@@ -151,7 +151,30 @@ class TestBuildDatadogQuery:
             value="ERROR",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_dd_query(f) == "-status:error"
+        assert backend._filter_to_dd_query(f) == '-status:"error"'
+
+    def test_status_mixed_case_equals_is_lowercased(self) -> None:
+        """Filter.value isn't constrained to "OK"/"ERROR" casing - any
+        caller-supplied casing must still normalize to Datadog's lowercase
+        status facet instead of only exact-matching known literals."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.EQUALS,
+            value="Error",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) == 'status:"error"'
+
+    def test_status_mixed_case_not_equals_is_lowercased(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.NOT_EQUALS,
+            value="Ok",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) == '-status:"ok"'
 
     def test_duration_gte_converts_ms_to_ns(self) -> None:
         backend = _backend()
