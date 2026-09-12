@@ -96,7 +96,7 @@ class TestBuildDatadogQuery:
             value="my-service",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_dd_query(f) == "service:my-service"
+        assert backend._filter_to_dd_query(f) == 'service:"my-service"'
 
     def test_equals_custom_attribute_is_at_prefixed(self) -> None:
         backend = _backend()
@@ -106,7 +106,7 @@ class TestBuildDatadogQuery:
             value="openai",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_dd_query(f) == "@gen_ai.system:openai"
+        assert backend._filter_to_dd_query(f) == '@gen_ai.system:"openai"'
 
     def test_not_equals(self) -> None:
         backend = _backend()
@@ -116,7 +116,7 @@ class TestBuildDatadogQuery:
             value="openai",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_dd_query(f) == "-@gen_ai.system:openai"
+        assert backend._filter_to_dd_query(f) == '-@gen_ai.system:"openai"'
 
     def test_status_error_equals(self) -> None:
         backend = _backend()
@@ -143,6 +143,38 @@ class TestBuildDatadogQuery:
         )
         assert backend._filter_to_dd_query(f) == "@duration:{* TO 5000000000}"
 
+    def test_equals_escapes_embedded_quote(self) -> None:
+        """A crafted filter value can't inject additional query clauses."""
+        backend = _backend()
+        f = Filter(
+            field="gen_ai.system",
+            operator=FilterOperator.EQUALS,
+            value='a" OR *:*',
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) == '@gen_ai.system:"a\\" OR *:*"'
+
+    def test_range_operator_rejects_non_numeric_value(self) -> None:
+        """Filter.value_type isn't enforced against the actual Python type,
+        so a range operator with a string value must be rejected rather than
+        interpolated unchecked into a numeric range expression."""
+        backend = _backend()
+        f = Filter(
+            field="duration",
+            operator=FilterOperator.GT,
+            value="1000 TO *} OR @duration:{0",
+            value_type=FilterType.NUMBER,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
+    def test_range_operator_rejects_bool_value(self) -> None:
+        """bool is an int subclass in Python but not a sensible range operand."""
+        backend = _backend()
+        f = Filter(
+            field="duration", operator=FilterOperator.GTE, value=True, value_type=FilterType.NUMBER
+        )
+        assert backend._filter_to_dd_query(f) is None
+
     def test_exists(self) -> None:
         backend = _backend()
         f = Filter(
@@ -165,8 +197,8 @@ class TestBuildDatadogQuery:
             values=["openai", "anthropic"],
             value_type=FilterType.STRING,
         )
-        assert (
-            backend._filter_to_dd_query(f) == "(@gen_ai.system:openai OR @gen_ai.system:anthropic)"
+        assert backend._filter_to_dd_query(f) == (
+            '(@gen_ai.system:"openai" OR @gen_ai.system:"anthropic")'
         )
 
     def test_build_dd_query_empty_defaults_to_wildcard(self) -> None:
@@ -189,7 +221,7 @@ class TestBuildDatadogQuery:
                 value_type=FilterType.STRING,
             ),
         ]
-        assert backend._build_dd_query(filters) == "service:svc AND @gen_ai.system:openai"
+        assert backend._build_dd_query(filters) == ('service:"svc" AND @gen_ai.system:"openai"')
 
 
 class TestParseDatadogSpan:
@@ -542,3 +574,88 @@ class TestSearchSpansRawPagination:
         result = await backend._search_spans_raw("*", now, now, limit=100_000)
 
         assert len(result) == 10  # _MAX_SEARCH_PAGES pages x 1 span each
+
+    async def test_malformed_data_field_does_not_crash(self) -> None:
+        """A 200 response whose 'data' field isn't a list (or contains a
+        non-dict entry) must not corrupt the collected results."""
+        backend = _backend()
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return {"data": {"unexpected": {}}, "meta": {}}
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=10)
+
+        assert result == []
+
+    async def test_non_dict_entries_in_data_are_skipped(self) -> None:
+        backend = _backend()
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return {"data": [{"attributes": {"span_id": "ok"}}, "not-a-span", 123], "meta": {}}
+
+        async def fake_post(*args: object, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+        backend._client = type("FakeClient", (), {"post": fake_post, "is_closed": False})()
+
+        now = datetime(2023, 1, 2, tzinfo=UTC)
+        result = await backend._search_spans_raw("*", now, now, limit=10)
+
+        assert result == [{"attributes": {"span_id": "ok"}}]
+
+
+class TestGetServiceOperationsEscaping:
+    """Test that get_service_operations escapes the service name in its query."""
+
+    async def test_escapes_service_name(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        await backend.get_service_operations('svc" OR *:*')
+
+        call_args = backend._search_spans_raw.call_args
+        dd_query = call_args.args[0]
+        assert dd_query == 'service:"svc\\" OR *:*"'
+
+
+class TestGetTraceUsesFullPaginationCapacity:
+    """get_trace's contract is "the complete trace" - it should target the
+    full pagination capacity, not a single page's worth."""
+
+    async def test_requests_full_pagination_capacity(self) -> None:
+        from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES
+
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "attributes": {
+                        "trace_id": "t1",
+                        "span_id": "s1",
+                        "service": "svc",
+                        "resource_name": "op",
+                        "start_timestamp": "2023-01-02T09:42:36.320Z",
+                        "end_timestamp": "2023-01-02T09:42:36.420Z",
+                    }
+                }
+            ]
+        )
+
+        await backend.get_trace("t1")
+
+        call_args = backend._search_spans_raw.call_args
+        assert call_args.kwargs.get("limit") == _MAX_SEARCH_PAGES * 1000

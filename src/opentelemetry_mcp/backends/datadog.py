@@ -288,7 +288,14 @@ class DatadogBackend(BaseBackend):
         # it can't inject additional query clauses.
         dd_query = f"trace_id:{self._escape_dd_query_value(trace_id)}"
 
-        spans_data = await self._search_spans_raw(dd_query, start, end, limit=1000)
+        # get_trace's contract is "the complete trace", unlike the sampling/
+        # search operations elsewhere in this backend - so its target span
+        # count matches _search_spans_raw's own full pagination capacity
+        # rather than a single page. A trace with more spans than that would
+        # still truncate, logged by _search_spans_raw itself.
+        spans_data = await self._search_spans_raw(
+            dd_query, start, end, limit=_MAX_SEARCH_PAGES * 1000
+        )
 
         spans: list[SpanData] = []
         for span_obj in spans_data:
@@ -347,7 +354,7 @@ class DatadogBackend(BaseBackend):
         logger.debug(f"Getting operations for service: {service_name}")
         start, end = self._time_range(None, None)
 
-        dd_query = f"service:{self._quote_if_needed(service_name)}"
+        dd_query = f"service:{self._escape_dd_query_value(service_name)}"
         spans_data = await self._search_spans_raw(dd_query, start, end, limit=1000)
 
         operations: set[str] = set()
@@ -439,10 +446,22 @@ class DatadogBackend(BaseBackend):
             response.raise_for_status()
 
             data = response.json()
-            collected.extend(data.get("data", []))
+
+            # A 200 response with an unexpected shape (e.g. `data` not a
+            # list, or a non-dict entry) would otherwise get extended into
+            # `collected` as-is and blow up later wherever a caller does
+            # `span_obj.get(...)`. Validate the shape here instead.
+            page_items = data.get("data", [])
+            if not isinstance(page_items, list):
+                logger.warning(
+                    f"Datadog search response 'data' was not a list "
+                    f"(got {type(page_items).__name__}); treating as empty"
+                )
+                page_items = []
+            collected.extend(item for item in page_items if isinstance(item, dict))
 
             cursor = data.get("meta", {}).get("page", {}).get("after")
-            if not cursor:
+            if not isinstance(cursor, str) or not cursor:
                 break
         else:
             logger.warning(
@@ -508,20 +527,15 @@ class DatadogBackend(BaseBackend):
         # the `@` prefix per Datadog's search syntax for non-facet attributes.
         return f"@{field}"
 
-    def _quote_if_needed(self, value: str) -> str:
-        """Quote a search term if it contains whitespace."""
-        if " " in value:
-            return f'"{value}"'
-        return value
-
     def _escape_dd_query_value(self, value: str) -> str:
         """Escape and exact-quote a value for safe interpolation into a query.
 
-        Unlike `_quote_if_needed` (which only quotes for readability when a
-        term contains whitespace), this always quotes and escapes embedded
-        quotes/backslashes. Use it for values that can originate from
-        external input (e.g. an MCP tool call's trace_id argument), so they
-        can't inject additional query clauses.
+        Always quotes and escapes embedded quotes/backslashes, rather than
+        only quoting for readability when a term contains whitespace. Used
+        for every value interpolated into a Datadog query - filter values,
+        service names, and trace_id - since any of them can originate from
+        external input (e.g. an MCP tool call's argument) and must not be
+        able to inject additional query clauses.
 
         Args:
             value: Raw value to interpolate
@@ -557,29 +571,39 @@ class DatadogBackend(BaseBackend):
             if field == "status" and value == "OK":
                 return "status:ok"
             v = value * scale if isinstance(value, int | float) else value
-            return f"{field}:{self._quote_if_needed(str(v))}"
+            return f"{field}:{self._escape_dd_query_value(str(v))}"
 
         elif operator == FilterOperator.NOT_EQUALS:
             if field == "status" and value == "ERROR":
                 return "-status:error"
             v = value * scale if isinstance(value, int | float) else value
-            return f"-{field}:{self._quote_if_needed(str(v))}"
+            return f"-{field}:{self._escape_dd_query_value(str(v))}"
 
-        elif operator == FilterOperator.GT:
-            v = value * scale if isinstance(value, int | float) else value
-            return f"{field}:{{{v} TO *}}"
-
-        elif operator == FilterOperator.GTE:
-            v = value * scale if isinstance(value, int | float) else value
-            return f"{field}:[{v} TO *]"
-
-        elif operator == FilterOperator.LT:
-            v = value * scale if isinstance(value, int | float) else value
-            return f"{field}:{{* TO {v}}}"
-
-        elif operator == FilterOperator.LTE:
-            v = value * scale if isinstance(value, int | float) else value
-            return f"{field}:[* TO {v}]"
+        elif operator in (
+            FilterOperator.GT,
+            FilterOperator.GTE,
+            FilterOperator.LT,
+            FilterOperator.LTE,
+        ):
+            # Filter.value_type isn't enforced against the actual Python type
+            # of `value`, so a range operator could arrive with a string -
+            # interpolating that unchecked into a numeric range expression
+            # would let it alter or invalidate the query. Reject non-numeric
+            # operands instead.
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                logger.warning(
+                    f"Skipping non-numeric value for {operator.value} on {field!r}: {value!r}"
+                )
+                return None
+            v = value * scale
+            if operator == FilterOperator.GT:
+                return f"{field}:{{{v} TO *}}"
+            elif operator == FilterOperator.GTE:
+                return f"{field}:[{v} TO *]"
+            elif operator == FilterOperator.LT:
+                return f"{field}:{{* TO {v}}}"
+            else:
+                return f"{field}:[* TO {v}]"
 
         elif operator == FilterOperator.EXISTS:
             return f"{field}:*"
@@ -590,7 +614,7 @@ class DatadogBackend(BaseBackend):
         elif operator == FilterOperator.IN:
             if not values:
                 return None
-            or_terms = [f"{field}:{self._quote_if_needed(str(v))}" for v in values]
+            or_terms = [f"{field}:{self._escape_dd_query_value(str(v))}" for v in values]
             return "(" + " OR ".join(or_terms) + ")"
 
         logger.warning(f"Unsupported operator for Datadog query: {operator}")
