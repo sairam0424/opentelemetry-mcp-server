@@ -196,7 +196,7 @@ class DatadogBackend(BaseBackend):
         supported_operators = self.get_supported_operators()
         native_filters = [f for f in all_filters if f.operator in supported_operators]
 
-        dd_query = self._build_dd_query(native_filters)
+        dd_query, _ = self._build_dd_query(native_filters)
         start, end = self._time_range(query.start_time, query.end_time)
 
         spans_data = await self._search_spans_raw(dd_query, start, end, query.limit * 5)
@@ -247,13 +247,19 @@ class DatadogBackend(BaseBackend):
         native_filters = [f for f in all_filters if f.operator in supported_operators]
         client_filters = [f for f in all_filters if f.operator not in supported_operators]
 
+        dd_query, unconverted = self._build_dd_query(native_filters)
+        # A filter whose operator Datadog supports in principle can still
+        # fail to convert (e.g. a range operator with a non-numeric operand)
+        # and be silently dropped from dd_query - fall back to client-side
+        # filtering for those instead of treating them as satisfied.
+        client_filters = client_filters + unconverted
+
         if client_filters:
             logger.info(
                 f"Will apply {len(client_filters)} span filters client-side: "
                 f"{[(f.field, f.operator.value) for f in client_filters]}"
             )
 
-        dd_query = self._build_dd_query(native_filters)
         start, end = self._time_range(query.start_time, query.end_time)
 
         spans_data = await self._search_spans_raw(dd_query, start, end, query.limit * 2)
@@ -512,22 +518,30 @@ class DatadogBackend(BaseBackend):
         start = start_time or (end - lookback)
         return start, end
 
-    def _build_dd_query(self, filters: list[Filter]) -> str:
+    def _build_dd_query(self, filters: list[Filter]) -> tuple[str, list[Filter]]:
         """Build a Datadog span search query string from Filter objects.
 
         Args:
             filters: List of Filter conditions
 
         Returns:
-            Datadog span search query string (defaults to "*" if no filters)
+            Tuple of (Datadog span search query string, defaults to "*" if no
+            conditions converted) and the subset of `filters` that could not
+            be converted to a native condition (e.g. a range operator with a
+            non-numeric operand) and so were silently dropped from the query
+            rather than applied - callers must apply these another way.
         """
-        raw_conditions = [self._filter_to_dd_query(f) for f in filters]
-        conditions = [c for c in raw_conditions if c is not None]
+        conditions: list[str] = []
+        unconverted: list[Filter] = []
+        for filter_obj in filters:
+            condition = self._filter_to_dd_query(filter_obj)
+            if condition is None:
+                unconverted.append(filter_obj)
+            else:
+                conditions.append(condition)
 
-        if not conditions:
-            return "*"
-
-        return " AND ".join(conditions)
+        query = " AND ".join(conditions) if conditions else "*"
+        return query, unconverted
 
     def _dd_field(self, field: str) -> str:
         """Map an internal field name to its Datadog search syntax name.

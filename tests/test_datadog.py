@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES, DatadogBackend
-from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
+from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanQuery
 
 from .conftest import FakeJsonClient
 
@@ -205,7 +205,7 @@ class TestBuildDatadogQuery:
 
     def test_build_dd_query_empty_defaults_to_wildcard(self) -> None:
         backend = _backend()
-        assert backend._build_dd_query([]) == "*"
+        assert backend._build_dd_query([]) == ("*", [])
 
     def test_build_dd_query_joins_with_and(self) -> None:
         backend = _backend()
@@ -223,7 +223,21 @@ class TestBuildDatadogQuery:
                 value_type=FilterType.STRING,
             ),
         ]
-        assert backend._build_dd_query(filters) == ('service:"svc" AND @gen_ai.system:"openai"')
+        query, unconverted = backend._build_dd_query(filters)
+        assert query == 'service:"svc" AND @gen_ai.system:"openai"'
+        assert unconverted == []
+
+    def test_build_dd_query_returns_unconverted_filters(self) -> None:
+        backend = _backend()
+        bad_range_filter = Filter(
+            field="duration",
+            operator=FilterOperator.GT,
+            value="not-a-number",
+            value_type=FilterType.NUMBER,
+        )
+        query, unconverted = backend._build_dd_query([bad_range_filter])
+        assert query == "*"
+        assert unconverted == [bad_range_filter]
 
 
 class TestParseDatadogSpan:
@@ -686,3 +700,52 @@ class TestSearchSpansRawMalformedEnvelope:
         result = await backend._search_spans_raw("*", now, now, limit=10)
 
         assert result == [{"attributes": {"span_id": "s1"}}]
+
+
+class TestSearchSpansFallsBackForUnconvertedNativeFilters:
+    """A range filter (GT/GTE/LT/LTE) is classified as natively-supported by
+    operator, but _filter_to_dd_query can still reject its operand (e.g.
+    non-numeric) and drop it from the query. search_spans must not then
+    treat the filter as satisfied - it has to fall back to client-side
+    filtering for it, the same as it does for operators Datadog can't
+    express at all. Otherwise dd_query silently degrades to "*" and the
+    filter is skipped entirely instead of applied or rejected."""
+
+    async def test_bad_range_operand_is_not_silently_dropped(self) -> None:
+        backend = _backend()
+        now = "2023-01-02T09:42:36.320Z"
+        later = "2023-01-02T09:42:36.420Z"
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "attributes": {
+                        "trace_id": "t1",
+                        "span_id": "s1",
+                        "service": "svc",
+                        "resource_name": "op",
+                        "start_timestamp": now,
+                        "end_timestamp": later,
+                    }
+                }
+            ]
+        )
+        query = SpanQuery(
+            filters=[
+                Filter(
+                    field="duration",
+                    operator=FilterOperator.GT,
+                    value="not-a-number",
+                    value_type=FilterType.NUMBER,
+                )
+            ]
+        )
+
+        spans = await backend.search_spans(query)
+
+        # The bad operand made the native query a no-op ("*" - see below),
+        # but the filter still must not be treated as satisfied: falling
+        # back to client-side evaluation correctly rejects every span
+        # instead of returning them all unfiltered.
+        assert spans == []
+        dd_query = backend._search_spans_raw.call_args.args[0]
+        assert dd_query == "*"
