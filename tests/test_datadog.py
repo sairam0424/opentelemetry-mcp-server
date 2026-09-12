@@ -176,6 +176,31 @@ class TestBuildDatadogQuery:
         )
         assert backend._filter_to_dd_query(f) == '-status:"ok"'
 
+    def test_status_unset_equals_is_unsupported(self) -> None:
+        """ "UNSET" is a value this codebase's own status model allows
+        (SpanData.status) but Datadog's status facet only recognizes
+        ok/error - a native query for it can never match, so it must be
+        rejected here to fall back to client-side filtering rather than
+        silently returning zero results."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.EQUALS,
+            value="UNSET",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
+    def test_status_unset_not_equals_is_unsupported(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.NOT_EQUALS,
+            value="UNSET",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
     def test_duration_gte_converts_ms_to_ns(self) -> None:
         backend = _backend()
         f = Filter(

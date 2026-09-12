@@ -604,13 +604,21 @@ class DatadogBackend(BaseBackend):
             # Datadog's status facet is lowercase ("ok", "error"); Filter.value
             # isn't constrained to match that casing (it's a freeform
             # str|int|float|bool from any caller), so normalize rather than
-            # whitelisting specific literal casings like "OK"/"ERROR".
+            # whitelisting specific literal casings like "OK"/"ERROR". Values
+            # this codebase's own status model allows but Datadog's facet
+            # doesn't (e.g. "UNSET") can't be expressed as a native query at
+            # all - return None so the caller falls back to client-side
+            # filtering instead of sending a query that can never match.
             v = value.lower() if field == "status" and isinstance(value, str) else value
+            if field == "status" and v not in ("ok", "error"):
+                return None
             v = v * scale if isinstance(v, int | float) else v
             return f"{field}:{self._escape_dd_query_value(str(v))}"
 
         elif operator == FilterOperator.NOT_EQUALS:
             v = value.lower() if field == "status" and isinstance(value, str) else value
+            if field == "status" and v not in ("ok", "error"):
+                return None
             v = v * scale if isinstance(v, int | float) else v
             return f"-{field}:{self._escape_dd_query_value(str(v))}"
 
